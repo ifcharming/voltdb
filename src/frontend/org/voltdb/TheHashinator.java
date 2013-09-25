@@ -61,11 +61,14 @@ public abstract class TheHashinator {
     public abstract byte[] getConfigBytes();
 
     /**
-     * Implementer should return compressed (cooked) bytes for serialization.
-     * @return config bytes
-     * @throws IOException
+     * Return compressed (cooked) bytes for serialization.
+     * Defaults to providing raw bytes, e.g. for legacy.
+     * @return cooked config bytes
      */
-    public abstract byte[] getCookedBytes() throws IOException;
+    public byte[] getCookedBytes()
+    {
+        return getConfigBytes();
+    }
 
     protected static final VoltLogger hostLogger = new VoltLogger("HOST");
 
@@ -81,6 +84,19 @@ public abstract class TheHashinator {
      */
     public static void initialize(Class<? extends TheHashinator> hashinatorImplementation, byte config[]) {
         instance.set(Pair.of(0L, constructHashinator( hashinatorImplementation, config, false)));
+    }
+
+    /**
+     * Get TheHashinator instanced based on knwon implementation and configuration.
+     * Used by client after asking server what it is running.
+     *
+     * @param hashinatorImplementation
+     * @param config
+     * @return
+     */
+    public static TheHashinator getHashinator(Class<? extends TheHashinator> hashinatorImplementation,
+            byte config[], boolean cooked) {
+        return constructHashinator(hashinatorImplementation, config, cooked);
     }
 
     /**
@@ -161,19 +177,18 @@ public abstract class TheHashinator {
      * @return A value between 0 and partitionCount-1, hopefully pretty evenly
      * distributed.
      */
-    static int hashinateBytes(byte[] bytes) {
+    int hashinateBytes(byte[] bytes) {
         if (bytes == null) {
             return 0;
         } else {
-            return instance.get().getSecond().pHashinateBytes(bytes);
+            return pHashinateBytes(bytes);
         }
     }
 
     /**
-     * Given an object, map it to a partition.
-     * DON'T EVER MAKE ME PUBLIC
+     * Given an object, map it to a partition. DON'T EVER MAKE ME PUBLIC
      */
-    private static int hashToPartition(Object obj) {
+    private static int hashToPartition(TheHashinator hashinator, Object obj) {
         HashinatorType type = getConfiguredHashinatorType();
         if (type == HashinatorType.LEGACY) {
             // Annoying, legacy hashes numbers and bytes differently, need to preserve that.
@@ -181,19 +196,20 @@ public abstract class TheHashinator {
                 return 0;
             } else if (obj instanceof Long) {
                 long value = ((Long) obj).longValue();
-                return hashinateLong(value);
+                return hashinator.pHashinateLong(value);
             } else if (obj instanceof Integer) {
-                long value = ((Integer)obj).intValue();
-                return hashinateLong(value);
+                long value = ((Integer) obj).intValue();
+                return hashinator.pHashinateLong(value);
             } else if (obj instanceof Short) {
-                long value = ((Short)obj).shortValue();
-                return hashinateLong(value);
+                long value = ((Short) obj).shortValue();
+                return hashinator.pHashinateLong(value);
             } else if (obj instanceof Byte) {
-                long value = ((Byte)obj).byteValue();
-                return hashinateLong(value);
+                long value = ((Byte) obj).byteValue();
+                return hashinator.pHashinateLong(value);
             }
         }
-        return hashinateBytes(valueToBytes(obj));
+        return hashinator.hashinateBytes(valueToBytes(obj));
+
     }
 
     /**
@@ -268,15 +284,32 @@ public abstract class TheHashinator {
     /**
      * Given the type of the targeting partition parameter and an object,
      * coerce the object to the correct type and hash it.
-     * NOTE NOTE NOTE NOTE!  THIS SHOULD BE THE ONLY WAY THAT YOU FIGURE OUT THE PARTITIONING
-     * FOR A PARAMETER!
+     * NOTE NOTE NOTE NOTE! THIS SHOULD BE THE ONLY WAY THAT
+     * YOU FIGURE OUT THE PARTITIONING FOR A PARAMETER! ON SERVER
+     *
      * @return The partition best set up to execute the procedure.
      * @throws VoltTypeException
      */
     public static int getPartitionForParameter(int partitionType, Object invocationParameter)
         throws VoltTypeException
     {
-        final VoltType partitionParamType = VoltType.get((byte)partitionType);
+        return instance.get().getSecond().getHashedPartitionForParameter(partitionType, invocationParameter);
+    }
+
+    /**
+     * Given the type of the targeting partition parameter and an object,
+     * coerce the object to the correct type and hash it.
+     * NOTE NOTE NOTE NOTE! THIS SHOULD BE THE ONLY WAY THAT YOU FIGURE OUT
+     * THE PARTITIONING FOR A PARAMETER! THIS IS SHARED BY SERVER AND CLIENT
+     * CLIENT USES direct instance method as it initializes its own per connection
+     * Hashinator.
+     *
+     * @return The partition best set up to execute the procedure.
+     * @throws VoltTypeException
+     */
+    public int getHashedPartitionForParameter(int partitionValueType, Object partitionValue)
+            throws VoltTypeException {
+        final VoltType partitionParamType = VoltType.get((byte) partitionValueType);
 
         // Special cases:
         // 1) if the user supplied a string for a number column,
@@ -285,25 +318,25 @@ public abstract class TheHashinator {
         // requiring the loader to know precise the schema.
         // 2) For legacy hashinators, if we have a numeric column but the param is in a byte
         // array, convert the byte array back to the numeric value
-        if (invocationParameter != null && partitionParamType.isPartitionableNumber()) {
-            if (invocationParameter.getClass() == String.class) {
+        if (partitionValue != null && partitionParamType.isPartitionableNumber()) {
+            if (partitionValue.getClass() == String.class) {
                 {
                     Object tempParam = ParameterConverter.stringToLong(
-                            invocationParameter,
+                            partitionValue,
                             partitionParamType.classFromType());
                     // Just in case someone managed to feed us a non integer
                     if (tempParam != null) {
-                        invocationParameter = tempParam;
+                        partitionValue = tempParam;
                     }
                 }
             }
-            else if (getConfiguredHashinatorType() == HashinatorType.LEGACY &&
-                     invocationParameter.getClass() == byte[].class) {
-                invocationParameter = bytesToValue(partitionParamType, (byte[])invocationParameter);
+            else if (getConfiguredHashinatorType() == HashinatorType.LEGACY
+                    && partitionValue.getClass() == byte[].class) {
+                partitionValue = bytesToValue(partitionParamType, (byte[]) partitionValue);
             }
         }
 
-        return hashToPartition(invocationParameter);
+        return hashToPartition(this, partitionValue);
     }
 
     /**
@@ -434,7 +467,7 @@ public abstract class TheHashinator {
      * @return optimized configuration data
      * @throws IOException
      */
-    public static synchronized HashinatorSnapshotData serializeConfiguredHashinator()
+    public static HashinatorSnapshotData serializeConfiguredHashinator()
             throws IOException
     {
         HashinatorSnapshotData hashData = null;
@@ -465,5 +498,17 @@ public abstract class TheHashinator {
     {
         Pair<Long, ? extends TheHashinator> currentHashinator = instance.get();
         return Pair.of(currentHashinator.getFirst(), currentHashinator.getSecond().pGetCurrentConfig().getSecond());
+    }
+
+    /**
+     * Get the current version/config in compressed (wire) format.
+     * @return version/config pair
+     */
+    public static Pair<Long, byte[]> getCurrentVersionedConfigCooked()
+    {
+        Pair<Long, ? extends TheHashinator> currentHashinator = instance.get();
+        Long version = currentHashinator.getFirst();
+        byte[] bytes = currentHashinator.getSecond().getCookedBytes();
+        return Pair.of(version, bytes);
     }
 }
